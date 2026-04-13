@@ -1,0 +1,347 @@
+// Prisma schema for ICERSS — Integrated Community Emergency Response Support System
+// Kisauni, Mombasa, Kenya
+// Database: PostgreSQL (replaces Frappe/MariaDB from architecture doc)
+
+generator client {
+  provider = "prisma-client"
+  output   = "../app/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ─── Enums ────────────────────────────────────────────────────────────────────
+
+enum IncidentType {
+  fire
+  medical
+  flood
+  accident
+  security
+}
+
+enum Severity {
+  low
+  medium
+  high
+  critical
+}
+
+enum IncidentStatus {
+  REPORTED
+  ASSIGNED
+  IN_PROGRESS
+  RESOLVED
+  ESCALATED
+  CANCELLED
+}
+
+enum Language {
+  en
+  sw
+}
+
+enum SmsStatus {
+  PENDING
+  SENT
+  FAILED
+  DELIVERED
+}
+
+enum AssistanceType {
+  transport
+  food_water
+  shelter
+  welfare_check
+  other
+}
+
+enum AssistanceStatus {
+  OPEN
+  IN_PROGRESS
+  CLOSED
+}
+
+enum AgencyType {
+  red_cross
+  police
+  fire
+  health
+  community
+}
+
+enum ResponderType {
+  ambulance
+  police
+  fire_crew
+  volunteer
+}
+
+enum ResponderStatus {
+  AVAILABLE
+  BUSY
+  OFFLINE
+}
+
+enum SmsDirection {
+  inbound
+  outbound
+}
+
+enum SmsLogStatus {
+  QUEUED
+  SENT
+  DELIVERED
+  FAILED
+}
+
+enum LogAction {
+  CREATED
+  ASSIGNED
+  ACK
+  RESOLVED
+  ESCALATED
+  SMS_SENT
+  SMS_FAILED
+  MERGED
+  REASSIGNED
+  CANCELLED
+}
+
+// ─── Models ───────────────────────────────────────────────────────────────────
+
+// 1. Incident — core entity, created on every confirmed USSD report
+model Incident {
+  id                  String         @id @default(cuid())
+  // Human-readable case ID shown to citizens: INC-2026-00123
+  // Derived from seqNum at creation time — stored for fast lookup
+  caseId              String         @unique
+  seqNum              Int            @default(autoincrement())
+  incidentType        IncidentType
+  severity            Severity
+  // 1-bit "life-threatening" from USSD confirm screen
+  lifeThreating       Boolean        @default(false)
+  status              IncidentStatus @default(REPORTED)
+  phoneNumber         String
+  language            Language
+  // Raw text the user typed (for "Other" location or for logging)
+  locationText        String?
+  locationId          String?
+  location            Location?      @relation(fields: [locationId], references: [id])
+  latitude            Float?
+  longitude           Float?
+  // Set when geocoder failed or user chose "Other" location
+  needsLocationReview Boolean        @default(false)
+  reportedAt          DateTime       @default(now())
+  acknowledgedAt      DateTime?
+  resolvedAt          DateTime?
+  // Required before status can be set to RESOLVED
+  resolutionNotes     String?
+  // Dedup counter — incremented when a duplicate report merges into this one
+  reportCount         Int            @default(1)
+  firstAidSmsStatus   SmsStatus      @default(PENDING)
+
+  assignments         IncidentAssignment[]
+  logs                IncidentLog[]
+  smsLogs             SMSLog[]
+
+  @@index([phoneNumber])
+  @@index([status])
+  @@index([reportedAt])
+  @@index([incidentType, latitude, longitude]) // for dedup radius check
+}
+
+// 2. IncidentAssignment — child table; one incident can have multiple agency assignments
+model IncidentAssignment {
+  id             String    @id @default(cuid())
+  incidentId     String
+  incident       Incident  @relation(fields: [incidentId], references: [id])
+  responderId    String
+  responder      Responder @relation(fields: [responderId], references: [id])
+  assignedAt     DateTime  @default(now())
+  acknowledgedAt DateTime?
+  alertSmsStatus SmsStatus @default(PENDING)
+  escalated      Boolean   @default(false)
+
+  @@index([incidentId])
+  @@index([responderId])
+}
+
+// 3. AssistanceRequest — non-emergency requests (transport, food, welfare check)
+// No Smart Routing, no Gemini, no responder SMS — separate 24h SLA queue
+model AssistanceRequest {
+  id                  String           @id @default(cuid())
+  // Human-readable ref: ASR-2026-00045
+  caseId              String           @unique
+  seqNum              Int              @default(autoincrement())
+  assistanceType      AssistanceType
+  status              AssistanceStatus @default(OPEN)
+  phoneNumber         String
+  language            Language
+  locationText        String?
+  locationId          String?
+  location            Location?        @relation(fields: [locationId], references: [id])
+  latitude            Float?
+  longitude           Float?
+  requestedAt         DateTime         @default(now())
+  assignedVolunteerId String?
+  assignedVolunteer   Responder?       @relation(fields: [assignedVolunteerId], references: [id])
+  notes               String?
+
+  @@index([phoneNumber])
+  @@index([status])
+}
+
+// 4. EOC — Emergency Operations Centre (Red Cross, Police, Health, etc.)
+model EOC {
+  id                   String         @id @default(cuid())
+  eocName              String
+  agencyType           AgencyType
+  latitude             Float
+  longitude            Float
+  coverageRadiusKm     Float          @default(10)
+  contactNumber        String
+  isActive             Boolean        @default(true)
+  // Incident types this EOC can handle — used by Smart Routing engine
+  handlesIncidentTypes IncidentType[]
+
+  responders           Responder[]
+}
+
+// 5. Responder — individual unit within an EOC (ambulance, officer, crew, volunteer)
+model Responder {
+  id                   String          @id @default(cuid())
+  responderName        String
+  responderType        ResponderType
+  eocId                String
+  eoc                  EOC             @relation(fields: [eocId], references: [id])
+  contactNumber        String
+  currentStatus        ResponderStatus @default(AVAILABLE)
+  // Fine-grained — a fire crew within a multi-type EOC may only handle fire
+  handlesIncidentTypes IncidentType[]
+
+  assignments          IncidentAssignment[]
+  assistanceRequests   AssistanceRequest[]
+}
+
+// 6. Location — seeded Kisauni landmarks shown as a numbered USSD list
+model Location {
+  id               String   @id @default(cuid())
+  landmarkNameEn   String   // "Kisauni Market"
+  landmarkNameSw   String   // "Soko la Kisauni"
+  latitude         Float
+  longitude        Float
+  // Controls order in the USSD menu
+  displayOrder     Int
+  isActive         Boolean  @default(true)
+
+  incidents          Incident[]
+  assistanceRequests AssistanceRequest[]
+
+  @@index([displayOrder])
+}
+
+// 7. IncidentLog — immutable audit trail for every state change
+model IncidentLog {
+  id          String    @id @default(cuid())
+  incidentId  String
+  incident    Incident  @relation(fields: [incidentId], references: [id])
+  action      LogAction
+  // Null for system-initiated actions (routing, Gemini, cron jobs)
+  performedBy String?
+  // JSON context blob — e.g. { from: "REPORTED", to: "ASSIGNED", responderId: "..." }
+  details     Json?
+  timestamp   DateTime  @default(now())
+
+  @@index([incidentId])
+  @@index([timestamp])
+}
+
+// 8. PublicStatsSnapshot — singleton row updated every 5 min by a BullMQ job
+// Serves the public /dashboard without hitting live aggregation queries
+model PublicStatsSnapshot {
+  // Fixed ID enforces singleton pattern
+  id                  String   @id @default("singleton")
+  lastUpdated         DateTime @default(now())
+  totalIncidentsMonth Int      @default(0)
+  avgResponseTimeSec  Int      @default(0)
+  resolutionRatePct   Float    @default(0)
+  // JSON arrays for chart and heat map on public dashboard
+  incidentsByTypeJson Json?
+  incidentsByHourJson Json?
+}
+
+// 9. SMSLog — full inbound + outbound SMS audit trail
+model SMSLog {
+  id          String       @id @default(cuid())
+  phoneNumber String
+  direction   SmsDirection
+  message     String
+  incidentId  String?
+  incident    Incident?    @relation(fields: [incidentId], references: [id])
+  // AT message ID from delivery receipt callback
+  atMessageId String?
+  status      SmsLogStatus @default(QUEUED)
+  timestamp   DateTime     @default(now())
+
+  @@index([phoneNumber])
+  @@index([incidentId])
+  @@index([timestamp])
+}
+
+// ─── Auth (NextAuth / Auth.js) ────────────────────────────────────────────────
+// Standard Auth.js v5 tables required by @auth/prisma-adapter
+
+enum UserRole {
+  admin
+  eoc_operator
+}
+
+model User {
+  id            String    @id @default(cuid())
+  name          String?
+  email         String    @unique
+  emailVerified DateTime?
+  image         String?
+  role          UserRole  @default(eoc_operator)
+  passwordHash  String?
+  // Link to the EOC this operator belongs to (null = system admin)
+  eocId         String?
+  accounts      Account[]
+  sessions      Session[]
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+}
+
+model Account {
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String?
+  access_token      String?
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String?
+  session_state     String?
+  user              User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([provider, providerAccountId])
+}
+
+model Session {
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model VerificationToken {
+  identifier String
+  token      String
+  expires    DateTime
+
+  @@id([identifier, token])
+}
